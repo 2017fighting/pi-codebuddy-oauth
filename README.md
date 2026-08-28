@@ -1,0 +1,91 @@
+# pi-codebuddy-oauth
+
+为 [CodeBuddy](https://www.codebuddy.cn)（腾讯 IOA 编程助手）提供 [Pi](https://github.com/earendil-works/pi) 扩展，把 CodeBuddy 作为 **OpenAI 兼容 HTTP provider** 接入 Pi。
+
+与 [pi-codebuddy-sdk](https://github.com/RealAlexandreAI/pi-codebuddy-sdk)（spawn `codebuddy` CLI 子进程 + MCP bridge）不同，本扩展走**轻量 HTTP 直连**（`/v2/chat/completions`）：协议栈复用 pi-ai 内置 `openai-completions`，扩展只负责鉴权、模型发现、动态头注入与瞬时故障重试。无 CLI 依赖、无子进程、无会话文件管理。
+
+## 特性
+
+- **OAuth 登录** — Pi 原生 `/login` 流程接入 IOA：`/v2/plugin/auth/state` → 浏览器 → 轮询 token。token 刷新由 Pi 双检锁托管（5 分钟 skew 预刷新）。
+- **API Key 登录** — 设置 `CODEBUDDY_API_KEY`（`ck_xxx`）即可，无需浏览器。
+- **自动模型发现** — 调用 `GET /v3/config` 提取 craft agent 模型列表（5 分钟 TTL 缓存 + 单飞；登录后自动触发）。
+- **401/403 中途刷新重试** — 流式请求中 token 失效时自动刷新并重试一次（15 秒冷却防抖）。
+- **瞬时 400（code 11133）自动重试** — CodeBuddy 网关偶发把上游瞬时校验失败包装成 HTTP 400 `{"code":11133}` 返回；拦截器按 **1s → 4s → 10s → 25s** 退避幂等重发（最多 4 次，总等待 ≤40s），其他 400 原样透传。
+- **session 级 `X-Conversation-ID` 稳定化** — 同一 Pi session 复用同一 conversation id，提升上游 prompt cache 命中率（compaction 时淘汰）。
+- **环境自动切换** — 默认国内端点（`copilot.tencent.com`），`CODEBUDDY_NETWORK=internet` 切国际（`www.codebuddy.ai`），`CODEBUDDY_ENDPOINT` 覆盖完整 URL。
+
+## 安装
+
+```bash
+pi install npm:pi-codebuddy-oauth   # 发布后
+# 或本地路径
+pi install /path/to/pi-codebuddy-oauth
+```
+
+重启 `pi`，然后 `/model` → 选 `codebuddy/...`。
+
+## 登录
+
+**方式 1 — OAuth（推荐）**：
+
+```
+/login codebuddy
+```
+
+按提示在浏览器完成 IOA 登录，token 自动持久化。
+
+**方式 2 — API Key**：
+
+```bash
+export CODEBUDDY_API_KEY=ck_xxx
+```
+
+## 环境变量
+
+| 变量 | 默认 | 作用 |
+| ---- | ---- | ---- |
+| `CODEBUDDY_ENDPOINT` | _(空)_ | 完整 base URL 覆盖，优先级最高 |
+| `CODEBUDDY_NETWORK` | `internal` | `internal`/`ioa` → 国内端点；其他 → 国际端点 |
+| `CODEBUDDY_AUTH` | `auto` | `auto` / `oauth` / `api` |
+| `CODEBUDDY_API_KEY` | _(空)_ | API Key（`ck_xxx`），`auto` 模式下隐含启用 API Key 模式 |
+| `CODEBUDDY_MODEL` | _(空)_ | 强制覆盖请求 model（写进 `X-Model-ID`） |
+| `CODEBUDDY_STABLE_CONVERSATION` | `1` | `0` 关闭 session 级 conversation-id 稳定化 |
+| `CODEBUDDY_CONVERSATION_MAP_MAX` | `1000` | session → conversationId LRU 容量 |
+| `CODEBUDDY_TENANT_ID` / `CODEBUDDY_ENTERPRISE_ID` / `CODEBUDDY_USER_ID` | _(从 JWT 提)_ | 覆盖自动提取的身份头（仅 OAuth 模式） |
+
+## 架构
+
+```
+Pi agent
+  │ modelRuntime.streamSimple（auth 解析 / before_provider_headers）
+  ▼
+streamSimple wrapper（src/stream.ts）
+  │ 注入 22 头（X-Conversation-ID 稳定化 / B3 / X-Model-ID …）
+  │ 注入自定义 fetch
+  ▼
+auth-fetch 拦截器（src/auth-fetch.ts）
+  │ 认证头注入（oauth: Bearer + 租户身份头 / api: Bearer + X-API-Key）
+  │ 401/403 → 刷新 token 重试一次
+  │ 400+11133 → 1s/4s/10s/25s 幂等重发
+  ▼
+${server}/v2/chat/completions   （协议栈：pi-ai openai-completions）
+```
+
+| 模块 | 来源 |
+| ---- | ---- |
+| `auth-flow.ts` / `auth-state.ts` / `jwt.ts` / `headers.ts` / `lru.ts` / `fetch-json.ts` | 平移自 [opencode-codebuddy-oauth](https://github.com/minglo/opencode-codebuddy-oauth) |
+| `models.ts` | 平移 + 转换为 Pi `ProviderModelConfig` |
+| `auth-fetch.ts` | 平移改造：删 SSE 缓冲与预刷新（Pi 原生托管） |
+| `index.ts` / `stream.ts` | 新写：Pi extension 接线 |
+
+## 开发
+
+```bash
+npm install
+npm test        # vitest
+npm run typecheck
+```
+
+## 许可证
+
+[MIT](./LICENSE)

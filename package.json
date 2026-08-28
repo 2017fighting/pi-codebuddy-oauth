@@ -1,0 +1,43 @@
+{
+  "name": "pi-codebuddy-oauth",
+  "version": "0.1.0",
+  "description": "Pi extension that registers CodeBuddy (IOA) as an OpenAI-compatible HTTP provider with OAuth/API-key auth",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "codebuddy",
+    "ioa",
+    "oauth",
+    "provider"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/minglo/pi-codebuddy-oauth.git"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.3",
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@types/node": "^26.4.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}
