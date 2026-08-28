@@ -97,4 +97,4 @@ npm run typecheck
 
 ## 许可证
 
-[MIT](./LICENSE) — © 2026 SoulChildTc
+[MIT](./LICENSE) — © 2026 SoulChildTc；部分代码源自 [opencode-codebuddy-oauth](https://github.com/minglo/opencode-codebuddy-oauth) © 2026 Ming Lo (MIT)

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Ming Lo — 源自 https://github.com/minglo/opencode-codebuddy-oauth (MIT)
 // src/fetch-json.ts 关键结构
 function withTimeout(ms: number, external?: AbortSignal) {
   const ctrl = new AbortController();

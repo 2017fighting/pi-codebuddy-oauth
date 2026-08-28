@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Ming Lo — 源自 https://github.com/minglo/opencode-codebuddy-oauth (MIT)
 // src/auth-state.ts
 import { REFRESH_SKEW_MS } from "./config.js";
 import type { CodeBuddyConfig } from "./config.js";

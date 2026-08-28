@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Ming Lo — 源自 https://github.com/minglo/opencode-codebuddy-oauth (MIT)
 // src/jwt.ts
 export interface JwtPayload {
   iss?: string; tenant_id?: string; tenantId?: string;

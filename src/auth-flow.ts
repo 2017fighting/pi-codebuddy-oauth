@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Ming Lo — 源自 https://github.com/minglo/opencode-codebuddy-oauth (MIT)
 // src/auth-flow.ts — 平移自 opencode-codebuddy-oauth，无平台依赖
 import { fetchJson } from "./fetch-json.js";
 import { AUTH_STATE_TIMEOUT_MS, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, REFRESH_TIMEOUT_MS, PLATFORM } from "./config.js";

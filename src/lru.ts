@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Ming Lo — 源自 https://github.com/minglo/opencode-codebuddy-oauth (MIT)
 export class LRUMap<K, V> {
   private map = new Map<K, V>();
   constructor(private max: number) {}

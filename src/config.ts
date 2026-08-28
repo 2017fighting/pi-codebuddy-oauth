@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Ming Lo — 源自 https://github.com/minglo/opencode-codebuddy-oauth (MIT)
 // src/config.ts — 平移自 opencode-codebuddy-oauth；去掉 SSE 配置与 OpenCode auth.json 路径
 export const PROVIDER_ID = "codebuddy";
 export const CHAT_COMPLETIONS_PATH = "/v2/chat/completions";
