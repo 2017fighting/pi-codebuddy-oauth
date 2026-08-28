@@ -134,7 +134,6 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
       if (!models.length) return;
       registeredModels = models;
       register(models);
-      logger.info(`discovered ${models.length} models from /v3/config`);
     } catch (e) {
       const status = (e as any)?.status;
       if (status === 401 || status === 403) {

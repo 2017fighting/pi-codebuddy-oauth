@@ -34,8 +34,8 @@
     "url": "git+https://github.com/SoulChildTc/pi-codebuddy-oauth.git"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.84.2",
-    "@earendil-works/pi-coding-agent": ">=0.84.2"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.84.3",
