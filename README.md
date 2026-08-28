@@ -1,5 +1,8 @@
 # pi-codebuddy-oauth
 
+[![npm version](https://img.shields.io/npm/v/pi-codebuddy-oauth.svg)](https://www.npmjs.com/package/pi-codebuddy-oauth)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 为 [CodeBuddy](https://www.codebuddy.cn)（腾讯 IOA 编程助手）提供 [Pi](https://github.com/earendil-works/pi) 扩展，把 CodeBuddy 作为 **OpenAI 兼容 HTTP provider** 接入 Pi。
 
 与 [pi-codebuddy-sdk](https://github.com/RealAlexandreAI/pi-codebuddy-sdk)（spawn `codebuddy` CLI 子进程 + MCP bridge）不同，本扩展走**轻量 HTTP 直连**（`/v2/chat/completions`）：协议栈复用 pi-ai 内置 `openai-completions`，扩展只负责鉴权、模型发现、动态头注入与瞬时故障重试。无 CLI 依赖、无子进程、无会话文件管理。
@@ -17,8 +20,12 @@
 ## 安装
 
 ```bash
-pi install npm:pi-codebuddy-oauth   # 发布后
-# 或本地路径
+pi install npm:pi-codebuddy-oauth
+```
+
+或本地路径开发调试：
+
+```bash
 pi install /path/to/pi-codebuddy-oauth
 ```
 
@@ -57,7 +64,7 @@ export CODEBUDDY_API_KEY=ck_xxx
 
 ```
 Pi agent
-  │ modelRuntime.streamSimple（auth 解析 / before_provider_headers）
+  │ modelRuntime.streamSimple（auth 解析 / 凭据刷新）
   ▼
 streamSimple wrapper（src/stream.ts）
   │ 注入 22 头（X-Conversation-ID 稳定化 / B3 / X-Model-ID …）
@@ -70,6 +77,8 @@ auth-fetch 拦截器（src/auth-fetch.ts）
   ▼
 ${server}/v2/chat/completions   （协议栈：pi-ai openai-completions）
 ```
+
+token 的过期预检与刷新由 Pi 原生托管（`oauth.refreshToken`，5 分钟 skew + 双检锁，自动持久化到 Pi 凭据存储）；扩展维护一份独立快照（`~/.pi/agent/codebuddy-auth.json`）供请求期读取，流中途 401 时快照兜底刷新。
 
 | 模块 | 来源 |
 | ---- | ---- |
@@ -88,4 +97,4 @@ npm run typecheck
 
 ## 许可证
 
-[MIT](./LICENSE)
+[MIT](./LICENSE) — © 2026 SoulChildTc
