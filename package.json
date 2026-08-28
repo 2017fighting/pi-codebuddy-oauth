@@ -31,7 +31,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/minglo/pi-codebuddy-oauth.git"
+    "url": "git+https://github.com/SoulChildTc/pi-codebuddy-oauth.git"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.84.2",
+    "@earendil-works/pi-coding-agent": ">=0.84.2"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.84.3",
