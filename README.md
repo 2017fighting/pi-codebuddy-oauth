@@ -86,6 +86,21 @@ token 的过期预检与刷新由 Pi 原生托管（`oauth.refreshToken`，5 分
 | `models.ts` | 平移 + 转换为 Pi `ProviderModelConfig` |
 | `auth-fetch.ts` | 平移改造：删 SSE 缓冲与预刷新（Pi 原生托管） |
 | `index.ts` / `stream.ts` | 新写：Pi extension 接线 |
+| `model-cache.ts` | 新写：持久化模型列表，消除启动期发现竞态（见下） |
+
+### 模型列表缓存
+
+模型发现（`GET /v3/config`）是异步的，而会话恢复走同步路径。若会话在发现返回前恢复，
+`codebuddy/<具体模型>` 尚未注册，pi 会报
+`Warning: Could not restore model codebuddy/xxx (model no longer exists)` 并回落到 `auto`。
+
+为此，扩展把上次成功发现的模型落盘到 `~/.pi/agent/codebuddy-models-cache.json`，
+启动时先同步以缓存为种子注册，再等网络发现刷新缓存。缓存只影响「首个可见模型集合」的时机，
+不替代网络发现：发现失败时仍回落到已缓存列表或 `auto`。
+
+刻意不写入 `models.json`：codebuddy 是扩展注册的 provider，鉴权由 `auth-fetch` 拦截器注入
+（自定义 `streamSimple`）。在 `models.json` 声明同 id 的原生 provider 会产生 baseUrl/api
+双重定义并绕过拦截器，也会与 pi-model-manager 的跨进程锁相互干扰。
 
 ## 开发
 

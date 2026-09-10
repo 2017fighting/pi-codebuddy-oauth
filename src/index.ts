@@ -24,6 +24,7 @@ import { createCodebuddyStreamSimple } from "./stream.js";
 import { buildRequestHeaders, buildAuthHeaders } from "./headers.js";
 import { resolveIdentity, decodeJwtPayload } from "./jwt.js";
 import { fetchRemoteModels, remoteModelToPi, DEFAULT_MODEL, DiscoveryCache, type RemoteModel } from "./models.js";
+import { readCachedModels, writeCachedModels } from "./model-cache.js";
 import * as fs from "fs/promises";
 import { homedir } from "os";
 import { join, dirname } from "path";
@@ -124,7 +125,10 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
   function fallbackModels() {
     return modelsFromRemote([DEFAULT_MODEL]);
   }
-  let registeredModels = fallbackModels();
+  // 启动种子：优先用上次落盘的模型列表，避免会话恢复时模型还没发现完（见 model-cache.ts）
+  // 刻意不打日志：命中缓存是常规路径，每次启动都打印会污染 TUI/print 输出
+  const cachedModels = await readCachedModels();
+  let registeredModels = cachedModels.length ? cachedModels : fallbackModels();
 
   // 主动发现 + 重注册（registerProvider 可随时调用并立即生效）
   async function discoverAndReregister(token: string): Promise<void> {
@@ -134,6 +138,7 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
       if (!models.length) return;
       registeredModels = models;
       register(models);
+      await writeCachedModels(models);
     } catch (e) {
       const status = (e as any)?.status;
       if (status === 401 || status === 403) {
@@ -195,7 +200,11 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
           try {
             const remote = await discoveryCache.get(cred.access, { signal: context.signal });
             const models = modelsFromRemote(remote);
-            if (models.length) return models as any;
+            if (models.length) {
+              registeredModels = models;
+              await writeCachedModels(models);
+              return models as any;
+            }
           } catch (e) {
             logger.warn(`model discovery failed: ${(e as Error).message}`);
           }
@@ -207,10 +216,13 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
 
   register(registeredModels);
 
-  // 启动时已有快照 token → 后台发现真实模型列表（不阻塞启动）
+  // 启动时已有快照 token → 发现真实模型列表
+  // 注意：必须 await。原先的 void（fire-and-forget）会让发现与进程退出赛跑，
+  // --list-models 这类短命进程会在 /v3/config 返回前退出，缓存永远写不进。
+  // 扩展 factory 阶段 pi 会等待，且 discoveryCache 有 5s 超时与 try/catch 兜底，不会卡住启动。
   const mode = pickAuthMode(cfg, credToAuthState(syncSnapshot.value));
   if (mode === "oauth" && syncSnapshot.value?.access) {
-    void discoverAndReregister(syncSnapshot.value.access);
+    await discoverAndReregister(syncSnapshot.value.access);
   } else if (mode === "api" && !cfg.apiKey) {
     logger.warn("api key mode requested but no key found — set CODEBUDDY_API_KEY");
   }
