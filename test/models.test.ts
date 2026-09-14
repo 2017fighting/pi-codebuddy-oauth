@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import { remoteModelToPi, DEFAULT_MODEL } from "../src/models.js";
 import type { RemoteModel } from "../src/models.js";
 
@@ -33,6 +34,22 @@ describe("models (pi)", () => {
   it("disabledMultimodal 关闭图片输入", () => {
     const p = remoteModelToPi({ id: "claude-x", name: "X", supportsImages: true, disabledMultimodal: true });
     expect(p.input).toEqual(["text"]);
+  });
+  it("reasoning 模型强制 system 角色（CodeBuddy 拒绝 developer → 400）", () => {
+    const p = remoteModelToPi({ id: "claude-x", name: "X", supportsReasoning: true });
+    expect(p.compat?.supportsDeveloperRole).toBe(false);
+    const model: any = { ...p, api: "openai-completions", provider: "codebuddy", baseUrl: "https://x/v2" };
+    const captured: any[] = [];
+    const fetchFn = (async () => new Response("data: [DONE]\n\n", { status: 200, headers: { "Content-Type": "text/event-stream" } })) as any;
+    const stream = openAICompletionsApi().streamSimple(
+      model,
+      { systemPrompt: "sys", messages: [{ role: "user", content: "hi" }] } as any,
+      { apiKey: "x", fetch: fetchFn, onPayload: ((pl: any) => { captured.push(pl); return undefined; }) as any },
+    );
+    return (async () => {
+      for await (const _ of stream) { /* drain */ }
+      expect(captured[0].messages[0].role).toBe("system");
+    })();
   });
   it("非推理模型无 thinkingLevelMap", () => {
     const p = remoteModelToPi({ id: "plain", name: "P", supportsReasoning: false });

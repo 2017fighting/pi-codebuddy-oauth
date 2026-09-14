@@ -16,6 +16,7 @@ export interface PiModelConfig {
   contextWindow: number;
   maxTokens: number;
   thinkingLevelMap?: Record<string, string>;
+  compat?: { supportsDeveloperRole?: boolean };
 }
 
 export interface RemoteConfigResponse { code:number; data?:{ agents?:Array<{name:string; models?:string[]}>; models?:RemoteModel[] } }
@@ -81,6 +82,10 @@ export function remoteModelToPi(m: RemoteModel): PiModelConfig {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow,
     maxTokens,
+    // CodeBuddy 网关不接受 assistant-role 之外的 system→developer 角色：pi-ai 对
+    // reasoning 模型默认发 role:"developer" 承载 systemPrompt，网关返回 400 (code 11128)，
+    // 且 body 无 error 字段 → OpenAI SDK 报 "400 status code (no body)"。强制回退 system。
+    compat: { supportsDeveloperRole: false },
   };
   const effort = m.reasoning?.defaultEffort ?? m.reasoning?.effort;
   const efforts = m.reasoning?.supportedEfforts;
