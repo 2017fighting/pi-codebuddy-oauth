@@ -1,98 +1,58 @@
 import { describe, it, expect } from "vitest";
-import { parseStoredAuth, pickAuthMode, effectiveAuth, needsRefresh } from "../src/auth-state.js";
+import { bearerToken, looksLikeJwt, resolveAuth, PLACEHOLDER_API_KEY } from "../src/auth-state.js";
+import { decodeJwtPayload } from "../src/jwt.js";
 
-describe("parseStoredAuth 窄化守卫", () => {
-  it("损坏输入返回 undefined（非对象/缺字段/类型错）", () => {
-    expect(parseStoredAuth(null)).toBeUndefined();
-    expect(parseStoredAuth("bad")).toBeUndefined();
-    expect(parseStoredAuth({ type:"api" })).toBeUndefined(); // 缺 key
-    expect(parseStoredAuth({ type:"oauth", access:"a" })).toBeUndefined(); // 缺 refresh/expires
-    expect(parseStoredAuth({ type:"unknown", key:"k" })).toBeUndefined();
+function b64url(obj: unknown): string {
+  return Buffer.from(JSON.stringify(obj)).toString("base64url");
+}
+const JWT = `h.${b64url({ tenantId: "t", uid: "u" })}.s`;
+
+describe("bearerToken", () => {
+  it("从 HeadersInit（数组/对象/Headers）提取 Bearer", () => {
+    expect(bearerToken({ Authorization: `Bearer ${JWT}` })).toBe(JWT);
+    expect(bearerToken([["Authorization", `bearer ${JWT}`]] as HeadersInit)).toBe(JWT);
+    expect(bearerToken(new Headers({ Authorization: `Bearer ${JWT}` }))).toBe(JWT);
   });
-  it("合法 api 解析", () => {
-    expect(parseStoredAuth({ type:"api", key:"k" })).toEqual({ type:"api", key:"k" });
-  });
-  it("合法 oauth 解析", () => {
-    expect(parseStoredAuth({ type:"oauth", access:"a", refresh:"r", expires: 123 })).toEqual({ type:"oauth", access:"a", refresh:"r", expires:123 });
-  });
-  it("过期 oauth 仍解析（有效性由 effectiveAuth ตัดสิน）", () => {
-    expect(parseStoredAuth({ type:"oauth", access:"a", refresh:"r", expires: 0 })).toBeDefined();
+  it("缺失或非 Bearer 返回 null", () => {
+    expect(bearerToken(undefined)).toBeNull();
+    expect(bearerToken({})).toBeNull();
+    expect(bearerToken({ Authorization: "Basic abc" })).toBeNull();
   });
 });
 
-describe("pickAuthMode 全矩阵", () => {
-  it("cfg.auth=api 强制 api", () => {
-    expect(pickAuthMode({ auth:"api", apiKey:"" } as any, undefined)).toBe("api");
-    expect(pickAuthMode({ auth:"api", apiKey:"" } as any, { type:"oauth", access:"a" } as any)).toBe("api");
+describe("looksLikeJwt", () => {
+  it("三段且 payload 可解码 → true", () => {
+    expect(looksLikeJwt(JWT, decodeJwtPayload)).toBe(true);
   });
-  it("cfg.auth=oauth 强制 oauth", () => {
-    expect(pickAuthMode({ auth:"oauth", apiKey:"ck_xxx" } as any, undefined)).toBe("oauth");
-  });
-  it("auto 时 apiKey 优先", () => {
-    expect(pickAuthMode({ auth:"auto", apiKey:"ck_xxx" } as any, undefined)).toBe("api");
-  });
-  it("auto 时 stored api 优先", () => {
-    expect(pickAuthMode({ auth:"auto", apiKey:"" } as any, { type:"api", key:"k" } as any)).toBe("api");
-  });
-  it("auto 时默认 oauth", () => {
-    expect(pickAuthMode({ auth:"auto", apiKey:"" } as any, undefined)).toBe("oauth");
-    expect(pickAuthMode({ auth:"auto", apiKey:"" } as any, { type:"oauth", access:"a", refresh:"r", expires: 999 } as any)).toBe("oauth");
+  it("ck_ key / 两段 / payload 非 JSON → false", () => {
+    expect(looksLikeJwt("ck_xxx", decodeJwtPayload)).toBe(false);
+    expect(looksLikeJwt("a.b", decodeJwtPayload)).toBe(false);
+    expect(looksLikeJwt("a.###.c", decodeJwtPayload)).toBe(false);
   });
 });
 
-describe("effectiveAuth 单分支", () => {
-  it("api 模式：cfg.apiKey 优先", () => {
-    const cfg = { auth:"api", apiKey:"cfg-key" } as any;
-    expect(effectiveAuth({ type:"api", key:"stored" } as any, cfg)).toEqual({ type:"api", key:"cfg-key" });
+describe("resolveAuth", () => {
+  it("占位符 / 缺头 → null（未认证）", () => {
+    expect(resolveAuth({ Authorization: `Bearer ${PLACEHOLDER_API_KEY}` }, { auth: "auto", apiKey: "" }, decodeJwtPayload)).toBeNull();
+    expect(resolveAuth(undefined, { auth: "auto", apiKey: "" }, decodeJwtPayload)).toBeNull();
   });
-  it("api 模式：无 cfg 时用 stored", () => {
-    const cfg = { auth:"api", apiKey:"" } as any;
-    expect(effectiveAuth({ type:"api", key:"stored" } as any, cfg)).toEqual({ type:"api", key:"stored" });
+  it("env api key（auto 模式）→ api", () => {
+    expect(resolveAuth({ Authorization: `Bearer ${JWT}` }, { auth: "auto", apiKey: "ck_env" }, decodeJwtPayload))
+      .toEqual({ type: "api", key: "ck_env" });
   });
-  it("A2：api 模式无 key 返回 null（由上层 warn，非静默 fallback）", () => {
-    const cfg = { auth:"api", apiKey:"" } as any;
-    expect(effectiveAuth(undefined, cfg)).toBeNull();
-    expect(effectiveAuth({ type:"oauth", access:"a", refresh:"r", expires: Date.now()+10000 } as any, cfg)).toBeNull();
+  it("auth=api 无 key → null", () => {
+    expect(resolveAuth({ Authorization: `Bearer ${JWT}` }, { auth: "api", apiKey: "" }, decodeJwtPayload)).toBeNull();
   });
-  it("oauth 单分支：未过期返回", () => {
-    const cfg = { auth:"oauth", apiKey:"" } as any;
-    const stored = { type:"oauth", access:"a", refresh:"r", expires: Date.now()+100000 };
-    expect(effectiveAuth(stored as any, cfg)).toEqual({ type:"oauth", access:"a", refresh:"r", expires: stored.expires });
+  it("JWT bearer → oauth", () => {
+    expect(resolveAuth({ Authorization: `Bearer ${JWT}` }, { auth: "auto", apiKey: "" }, decodeJwtPayload))
+      .toEqual({ type: "oauth", access: JWT });
   });
-  it("oauth 单分支：过期 token 仍返回（expires 校验删除，靠 401 刷新兜底）", () => {
-    const cfg = { auth:"oauth", apiKey:"" } as any;
-    const stored = { type:"oauth", access:"a", refresh:"r", expires: Date.now()-1000 };
-    const res = effectiveAuth(stored as any, cfg);
-    expect(res).not.toBeNull();
-    expect((res as any).access).toBe("a");
+  it("非 JWT bearer（Pi auth.json 存的 ck_ key）→ api", () => {
+    expect(resolveAuth({ Authorization: "Bearer ck_stored" }, { auth: "auto", apiKey: "" }, decodeJwtPayload))
+      .toEqual({ type: "api", key: "ck_stored" });
   });
-  it("oauth 缺 access 返回 null", () => {
-    const cfg = { auth:"oauth", apiKey:"" } as any;
-    expect(effectiveAuth({ type:"oauth", refresh:"r", expires: 123 } as any, cfg)).toBeNull();
-  });
-});
-
-describe("needsRefresh 边界", () => {
-  it("oauth 且 expires - skew < now 且 refresh 非空 → true", () => {
-    const now = Date.now();
-    const auth = { type:"oauth", access:"a", refresh:"r", expires: now + 4*60*1000 } as any; // 4min 内过期，skew 5min
-    expect(needsRefresh(auth, now)).toBe(true);
-  });
-  it("oauth 但 expir 远未到 → false", () => {
-    const now = Date.now();
-    const auth = { type:"oauth", access:"a", refresh:"r", expires: now + 10*60*1000 } as any;
-    expect(needsRefresh(auth, now)).toBe(false);
-  });
-  it("恰在 skew 边界外 → false", () => {
-    const now = Date.now();
-    const auth = { type:"oauth", access:"a", refresh:"r", expires: now + 5*60*1000 + 1000 } as any;
-    expect(needsRefresh(auth, now)).toBe(false);
-  });
-  it("api 类型永不刷新", () => {
-    expect(needsRefresh({ type:"api", key:"k" } as any, Date.now())).toBe(false);
-  });
-  it("oauth 但 refresh 为空 → false", () => {
-    const auth = { type:"oauth", access:"a", refresh:"", expires: Date.now() } as any;
-    expect(needsRefresh(auth, Date.now())).toBe(false);
+  it("auth=oauth 强制按 oauth 处理", () => {
+    expect(resolveAuth({ Authorization: "Bearer ck_forced" }, { auth: "oauth", apiKey: "" }, decodeJwtPayload))
+      .toEqual({ type: "oauth", access: "ck_forced" });
   });
 });

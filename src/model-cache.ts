@@ -29,8 +29,8 @@ interface CacheDocument {
   models: PiModelConfig[];
 }
 
-export function getModelCachePath(): string {
-  return join(homedir(), CONFIG_DIR_NAME || ".pi", "agent", "codebuddy-models-cache.json");
+export function getModelCachePath(providerId = "codebuddy"): string {
+  return join(homedir(), CONFIG_DIR_NAME || ".pi", "agent", `${providerId}-models-cache.json`);
 }
 
 function isValidModel(value: unknown): value is PiModelConfig {
@@ -40,9 +40,9 @@ function isValidModel(value: unknown): value is PiModelConfig {
 }
 
 /** 读取缓存的模型列表；缺失、损坏或为空时返回 []。永不抛错。 */
-export async function readCachedModels(): Promise<PiModelConfig[]> {
+export async function readCachedModels(providerId = "codebuddy"): Promise<PiModelConfig[]> {
   try {
-    const raw = await fs.readFile(getModelCachePath(), "utf8");
+    const raw = await fs.readFile(getModelCachePath(providerId), "utf8");
     const parsed = JSON.parse(raw) as Partial<CacheDocument>;
     if (parsed?.version !== CACHE_VERSION) return [];
     if (!Array.isArray(parsed.models)) return [];
@@ -58,9 +58,9 @@ export async function readCachedModels(): Promise<PiModelConfig[]> {
 }
 
 /** 写入缓存（先写临时文件再 rename，避免读到半截内容）。永不抛错。 */
-export async function writeCachedModels(models: PiModelConfig[]): Promise<void> {
+export async function writeCachedModels(models: PiModelConfig[], providerId = "codebuddy"): Promise<void> {
   if (!models?.length) return;
-  const path = getModelCachePath();
+  const path = getModelCachePath(providerId);
   const doc: CacheDocument = { version: CACHE_VERSION, updatedAt: Date.now(), models };
   try {
     await fs.mkdir(dirname(path), { recursive: true });

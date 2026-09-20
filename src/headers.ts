@@ -79,7 +79,7 @@ export function buildRequestHeaders(
   return headers;
 }
 export function buildAuthHeaders(
-  auth: { type: "api"; key: string } | { type: "oauth"; access: string; refresh: string; expires: number },
+  auth: { type: "api"; key: string } | { type: "oauth"; access: string },
   identity: { tenantId: string; enterpriseId: string; userId: string },
 ): Record<string,string> {
   if (auth.type === "api") {

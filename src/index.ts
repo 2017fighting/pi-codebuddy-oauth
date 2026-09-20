@@ -1,23 +1,25 @@
-// src/index.ts — Pi 扩展入口：注册 codebuddy provider（HTTP 直连 /v2/chat/completions）
+// src/index.ts — Pi 扩展入口：注册 codebuddy（国内）+ codebuddy-intl（国际）两个 provider
+// （HTTP 直连 /v2/chat/completions）
 //
-// 数据流：
+// 数据流（每个 provider 实例独立一套）：
 //   Pi agent → modelRuntime.streamSimple（auth 解析 + before_provider_headers 合并）
 //     → 本插件 streamSimple wrapper（注入 22 头 + 自定义 fetch）
-//     → auth-fetch 拦截器（认证头注入 + 401/403 刷新重试 + 11133 瞬时 400 退避）
+//     → auth-fetch 拦截器（从 host 注入的 Authorization 解析 token + 认证头注入 + 11133 退避）
 //     → ${server}/v2/chat/completions
 //
-// 与 opencode 版的对应关系：
-//   opencode auth.loader.fetch  → SimpleStreamOptions.fetch（auth-fetch 拦截器）
-//   opencode chat.headers       → wrapper 内 options.headers（provider 边界清晰，事件无 provider 信息）
-//   opencode config（模型发现） → registerProvider.models + 登录/启动后主动发现重注册
-//   opencode auth.methods       → registerProvider.oauth.login / refreshToken（Pi 原生 /login）
+// 凭据唯一事实源是 Pi 的 auth.json（按 provider id 各存一份：codebuddy / codebuddy-intl）：
+// Pi 每流解析 + 过期带锁预刷新，经 options.apiKey 注入 Authorization 头；
+// 本扩展不再维护本地 token 快照（原 codebuddy-auth.json 已废弃，可手动删除）。
+// 模型发现改为懒触发：首个请求携带 token 时发现并重注册。
+//
+// 双 provider 常驻注册后，原 CODEBUDDY_NETWORK 环境变量废弃：
+// 国际侧直接用 codebuddy-intl/... 模型，无需重启切换。
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks, RefreshModelsContext } from "@earendil-works/pi-ai";
-import { getConfig, resolveServerUrl, PROVIDER_ID, CHAT_COMPLETIONS_PATH, POLL_TOTAL_TIMEOUT_MS, DEFAULT_EXPIRES_MS } from "./config.js";
+import { getConfig, resolveServerUrl, SERVER_CN, SERVER_INTL, CHAT_COMPLETIONS_PATH, POLL_TOTAL_TIMEOUT_MS, DEFAULT_EXPIRES_MS, type CodeBuddyServer } from "./config.js";
 import { createLogger } from "./log.js";
 import { LRUMap } from "./lru.js";
-import { effectiveAuth, pickAuthMode } from "./auth-state.js";
-import type { AuthState } from "./auth-state.js";
+import { PLACEHOLDER_API_KEY, resolveAuth } from "./auth-state.js";
 import { requestAuthState, pollForToken, refreshAccessToken } from "./auth-flow.js";
 import { createAuthFetch } from "./auth-fetch.js";
 import { createCodebuddyStreamSimple } from "./stream.js";
@@ -25,97 +27,26 @@ import { buildRequestHeaders, buildAuthHeaders } from "./headers.js";
 import { resolveIdentity, decodeJwtPayload } from "./jwt.js";
 import { fetchRemoteModels, remoteModelToPi, DEFAULT_MODEL, DiscoveryCache, type RemoteModel } from "./models.js";
 import { readCachedModels, writeCachedModels } from "./model-cache.js";
-import * as fs from "fs/promises";
-import { homedir } from "os";
-import { join, dirname } from "path";
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
-export default async function codebuddyExtension(pi: ExtensionAPI) {
-  const cfg = getConfig();
-  const server = resolveServerUrl(cfg);
+interface ProviderSpec {
+  id: string;
+  label: string;
+  /** 登录 UI 中显示的 OAuth 提供方名称 */
+  oauthName: string;
+  envPrefix: string;
+  server: CodeBuddyServer;
+  /** 未认证 401 指引里的 env 变量名 */
+  envKeyVar: string;
+}
+
+async function createCodebuddyProvider(pi: ExtensionAPI, spec: ProviderSpec): Promise<void> {
+  const cfg = getConfig(spec.envPrefix);
+  const server = resolveServerUrl(cfg.endpoint, spec.server);
   const logger = createLogger();
   const conversationIds = new LRUMap<string, string>(cfg.conversationMapMax);
   const discoveryCache = new DiscoveryCache({
     ttlMs: 5 * 60 * 1000,
     fetchFn: (token, signal) => fetchRemoteModels(token, server, signal),
-  });
-
-  // --- token 快照（~/.pi/agent/codebuddy-auth.json）---
-  // Pi CredentialStore 不对扩展暴露读取接口；login/refresh 全部经过本扩展，
-  // 顺手落一份独立快照供请求时读取。真实凭据源仍是 Pi auth.json（由 Pi 自动持久化）。
-  const snapshotPath = join(homedir(), CONFIG_DIR_NAME || ".pi", "agent", "codebuddy-auth.json");
-  const syncSnapshot: { value: OAuthCredentials | undefined } = { value: undefined };
-
-  async function loadSnapshot(): Promise<void> {
-    try {
-      const raw = await fs.readFile(snapshotPath, "utf8");
-      const o = JSON.parse(raw) as Partial<OAuthCredentials>;
-      if (typeof o.access === "string" && o.access) {
-        syncSnapshot.value = { access: o.access, refresh: o.refresh ?? "", expires: o.expires ?? 0 };
-      }
-    } catch { /* 不存在或损坏 → 未登录 */ }
-  }
-  await loadSnapshot();
-
-  async function persistSnapshot(cred: OAuthCredentials): Promise<void> {
-    syncSnapshot.value = cred;
-    try {
-      await fs.mkdir(dirname(snapshotPath), { recursive: true });
-      await fs.writeFile(snapshotPath, JSON.stringify(cred, null, 2), "utf8");
-    } catch (e) {
-      logger.error(`snapshot write failed: ${(e as Error).message}`);
-    }
-  }
-
-  function credToAuthState(cred: OAuthCredentials | undefined): AuthState | undefined {
-    if (!cred) return undefined;
-    return { type: "oauth", access: cred.access, refresh: cred.refresh ?? "", expires: cred.expires ?? 0 };
-  }
-
-  // --- 刷新（auth-fetch 401 兜底用）：单飞 + 写快照 ---
-  // Pi 原生 refreshToken 仅在 resolveStoredOAuth 过期路径触发；流中途 401 由这里兜底
-  class RefreshLock {
-    private inflight: Promise<AuthState | null> | null = null;
-    run(fn: () => Promise<AuthState | null>): Promise<AuthState | null> {
-      if (this.inflight) return this.inflight;
-      this.inflight = fn().finally(() => { this.inflight = null; });
-      return this.inflight;
-    }
-  }
-  const refreshLock = new RefreshLock();
-
-  async function refreshAndPersist(oauthAuth: AuthState & { type: "oauth" }): Promise<AuthState | null> {
-    return refreshLock.run(async () => {
-      const r = await refreshAccessToken(oauthAuth.refresh, server.url);
-      if (r?.accessToken) {
-        const cred: OAuthCredentials = {
-          access: r.accessToken,
-          refresh: r.refreshToken || oauthAuth.refresh,
-          expires: r.expiresIn ? Date.now() + r.expiresIn * 1000 : Date.now() + DEFAULT_EXPIRES_MS,
-        };
-        await persistSnapshot(cred);
-        return credToAuthState(cred)!;
-      }
-      logger.warn("token refresh failed — token may be expired, re-run /login codebuddy");
-      return null;
-    });
-  }
-
-  // --- auth-fetch 拦截器 + streamSimple wrapper ---
-  const authFetch = createAuthFetch({
-    getAuth: async () => effectiveAuth(credToAuthState(syncSnapshot.value), cfg),
-    server,
-    buildAuthHeaders,
-    resolveIdentity: resolveIdentity as any,
-    decodeJwtPayload,
-    refreshAndPersist,
-    cfg,
-    logger,
-    chatCompletionsPath: CHAT_COMPLETIONS_PATH,
-  });
-  const streamSimple = createCodebuddyStreamSimple(authFetch, {
-    buildHeaders: (model, options) =>
-      buildRequestHeaders(options?.sessionId, model.id, { cfg, server, lru: conversationIds }),
   });
 
   // --- 模型列表 ---
@@ -127,7 +58,7 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
   }
   // 启动种子：优先用上次落盘的模型列表，避免会话恢复时模型还没发现完（见 model-cache.ts）
   // 刻意不打日志：命中缓存是常规路径，每次启动都打印会污染 TUI/print 输出
-  const cachedModels = await readCachedModels();
+  const cachedModels = await readCachedModels(spec.id);
   let registeredModels = cachedModels.length ? cachedModels : fallbackModels();
 
   // 主动发现 + 重注册（registerProvider 可随时调用并立即生效）
@@ -138,56 +69,74 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
       if (!models.length) return;
       registeredModels = models;
       register(models);
-      await writeCachedModels(models);
+      await writeCachedModels(models, spec.id);
     } catch (e) {
       const status = (e as any)?.status;
       if (status === 401 || status === 403) {
-        logger.warn("model discovery 401/403 — token may be expired, re-run /login codebuddy");
+        logger.warn(`[${spec.id}] model discovery 401/403 — token may be expired, re-run /login ${spec.id}`);
       } else {
-        logger.warn(`model discovery failed: ${(e as Error).message}`);
+        logger.warn(`[${spec.id}] model discovery failed: ${(e as Error).message}`);
       }
     }
   }
 
+  // --- auth-fetch 拦截器 + streamSimple wrapper ---
+  // token 来自 host 每流注入的 Authorization（Pi auth.json 解析 + 带锁预刷新）。
+  // 懒发现：首个请求携带有效 token 时触发（auth-fetch 对同一 token 只回调一次）；
+  // 无本地快照后这是启动后的主要发现入口，模型缓存种子保证发现完成前会话可恢复。
+  const authFetch = createAuthFetch({
+    resolveAuth: (headers) => resolveAuth(headers, cfg, decodeJwtPayload),
+    server,
+    buildAuthHeaders,
+    resolveIdentity: resolveIdentity as any,
+    decodeJwtPayload,
+    cfg,
+    logger,
+    chatCompletionsPath: CHAT_COMPLETIONS_PATH,
+    authHint: `run \`/login ${spec.id}\` (oauth) or set ${spec.envKeyVar}`,
+    onAuth: (a) => { if (a.type === "oauth") void discoverAndReregister(a.access); },
+  });
+  const streamSimple = createCodebuddyStreamSimple(authFetch, {
+    buildHeaders: (model, options) =>
+      buildRequestHeaders(options?.sessionId, model.id, { cfg, server, lru: conversationIds }),
+  });
+
   function register(models: typeof registeredModels) {
-    pi.registerProvider(PROVIDER_ID, {
-      name: "CodeBuddy",
+    pi.registerProvider(spec.id, {
+      name: spec.label,
       baseUrl: `${server.url}/v2`,
       api: "openai-completions",
       // 认证统一由 auth-fetch 拦截器注入（oauth 双头身份 + api 双头 key）；
-      // apiKey 仅作为 OpenAI client 的占位（拦截器会覆写 Authorization）
-      apiKey: cfg.apiKey || "not-used",
+      // apiKey 仅作为 OpenAI client 的占位（拦截器从 host 注入的 Authorization 解析真实凭据）
+      apiKey: cfg.apiKey || PLACEHOLDER_API_KEY,
       models: models as any,
       streamSimple,
       oauth: {
-        name: "CodeBuddy (IOA)",
+        name: spec.oauthName,
         async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
           const state = await requestAuthState(server.url);
-          callbacks.onAuth({ url: state.url, instructions: "请在浏览器中完成 IOA 登录" });
+          callbacks.onAuth({ url: state.url, instructions: `请在浏览器中完成 ${spec.label} 登录` });
           const expiresAt = Date.now() + POLL_TOTAL_TIMEOUT_MS;
           const tok = await pollForToken(server.url, state.state, expiresAt, callbacks.signal);
-          if (!tok?.accessToken) throw new Error("CodeBuddy IOA login failed or timed out");
+          if (!tok?.accessToken) throw new Error(`${spec.id} login failed or timed out`);
           const cred: OAuthCredentials = {
             access: tok.accessToken,
             refresh: tok.refreshToken || "",
             expires: tok.expiresIn ? Date.now() + tok.expiresIn * 1000 : Date.now() + DEFAULT_EXPIRES_MS,
           };
-          await persistSnapshot(cred);
-          // 登录后立即发现模型并重注册（Pi 的 credential-change refresh 走 allowNetwork:false，不触发网络发现）
+          // 凭据由 Pi 持久化（auth.json）；登录后立即发现模型并重注册
           void discoverAndReregister(cred.access);
           return cred;
         },
         async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-          if (!credentials.refresh) throw new Error("codebuddy: no refresh token stored");
+          if (!credentials.refresh) throw new Error(`${spec.id}: no refresh token stored`);
           const r = await refreshAccessToken(credentials.refresh, server.url);
-          if (!r?.accessToken) throw new Error("codebuddy: token refresh failed — re-run /login codebuddy");
-          const cred: OAuthCredentials = {
+          if (!r?.accessToken) throw new Error(`${spec.id}: token refresh failed — re-run /login ${spec.id}`);
+          return {
             access: r.accessToken,
             refresh: r.refreshToken || credentials.refresh,
             expires: r.expiresIn ? Date.now() + r.expiresIn * 1000 : Date.now() + DEFAULT_EXPIRES_MS,
           };
-          await persistSnapshot(cred);
-          return cred;
         },
         getApiKey(credentials: OAuthCredentials): string {
           return credentials.access;
@@ -202,11 +151,11 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
             const models = modelsFromRemote(remote);
             if (models.length) {
               registeredModels = models;
-              await writeCachedModels(models);
+              await writeCachedModels(models, spec.id);
               return models as any;
             }
           } catch (e) {
-            logger.warn(`model discovery failed: ${(e as Error).message}`);
+            logger.warn(`[${spec.id}] model discovery failed: ${(e as Error).message}`);
           }
         }
         return registeredModels as any;
@@ -216,20 +165,33 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
 
   register(registeredModels);
 
-  // 启动时已有快照 token → 发现真实模型列表
-  // 注意：必须 await。原先的 void（fire-and-forget）会让发现与进程退出赛跑，
-  // --list-models 这类短命进程会在 /v3/config 返回前退出，缓存永远写不进。
-  // 扩展 factory 阶段 pi 会等待，且 discoveryCache 有 5s 超时与 try/catch 兜底，不会卡住启动。
-  const mode = pickAuthMode(cfg, credToAuthState(syncSnapshot.value));
-  if (mode === "oauth" && syncSnapshot.value?.access) {
-    await discoverAndReregister(syncSnapshot.value.access);
-  } else if (mode === "api" && !cfg.apiKey) {
-    logger.warn("api key mode requested but no key found — set CODEBUDDY_API_KEY");
+  // api 模式显式请求但无 key：启动即提示（oauth 模式无需提示，未登录时请求会返回 401 指引）
+  if (cfg.auth === "api" && !cfg.apiKey) {
+    logger.warn(`[${spec.id}] api key mode requested but no key found — set ${spec.envKeyVar}`);
   }
 
   // --- compaction 后淘汰 conversation-id（对应 opencode session.compacted）---
   pi.on("session_before_compact", (_event, ctx) => {
     const sid = ctx.sessionManager.getSessionId();
     if (sid) conversationIds.delete(sid);
+  });
+}
+
+export default async function codebuddyExtension(pi: ExtensionAPI) {
+  await createCodebuddyProvider(pi, {
+    id: "codebuddy",
+    label: "CodeBuddy",
+    oauthName: "CodeBuddy (IOA)",
+    envPrefix: "CODEBUDDY",
+    server: SERVER_CN,
+    envKeyVar: "CODEBUDDY_API_KEY",
+  });
+  await createCodebuddyProvider(pi, {
+    id: "codebuddy-intl",
+    label: "CodeBuddy Intl",
+    oauthName: "CodeBuddy Intl",
+    envPrefix: "CODEBUDDY_INTL",
+    server: SERVER_INTL,
+    envKeyVar: "CODEBUDDY_INTL_API_KEY",
   });
 }

@@ -15,7 +15,8 @@
 - **401/403 中途刷新重试** — 流式请求中 token 失效时自动刷新并重试一次（15 秒冷却防抖）。
 - **瞬时 400（code 11133）自动重试** — CodeBuddy 网关偶发把上游瞬时校验失败包装成 HTTP 400 `{"code":11133}` 返回；拦截器按 **1s → 4s → 10s → 25s** 退避幂等重发（最多 4 次，总等待 ≤40s），其他 400 原样透传。
 - **session 级 `X-Conversation-ID` 稳定化** — 同一 Pi session 复用同一 conversation id，提升上游 prompt cache 命中率（compaction 时淘汰）。
-- **环境自动切换** — 默认国内端点（`copilot.tencent.com`），`CODEBUDDY_NETWORK=internet` 切国际（`www.codebuddy.ai`），`CODEBUDDY_ENDPOINT` 覆盖完整 URL。
+- **双 provider 常驻：国内 + 国际** — 同一扩展注册 `codebuddy`（国内 `copilot.tencent.com`）与 `codebuddy-intl`（国际 `www.codebuddy.ai`）两个 provider，各自独立登录/凭据/模型发现，无需重启切网。原 `CODEBUDDY_NETWORK` 废弃。两个模型家族可在 pi-multiprovider 的 `/vprovider` 里组成虚拟 provider 轮询/故障切换。
+- **凭据唯一事实源 = Pi auth.json** — token 每流由 Pi host 解析（过期带锁预刷新）并注入 Authorization 头，扩展不再维护本地 token 快照（原 `~/.pi/agent/codebuddy-auth.json` 废弃，可手动删除）。
 
 ## 安装
 
@@ -33,26 +34,25 @@ pi install /path/to/pi-codebuddy-oauth
 
 ## 登录
 
-**方式 1 — OAuth（推荐）**：
+两个 provider 各自独立登录（凭据按 provider id 存在 Pi 的 auth.json）：
 
 ```
-/login codebuddy
+/login codebuddy          # 国内（IOA）
+/login codebuddy-intl     # 国际
 ```
 
-按提示在浏览器完成 IOA 登录，token 自动持久化。
-
-**方式 2 — API Key**：
+按提示在浏览器完成登录，token 自动持久化。也可分别用 API Key：
 
 ```bash
-export CODEBUDDY_API_KEY=ck_xxx
+export CODEBUDDY_API_KEY=ck_xxx        # 国内
+export CODEBUDDY_INTL_API_KEY=ck_xxx   # 国际
 ```
 
 ## 环境变量
 
 | 变量 | 默认 | 作用 |
 | ---- | ---- | ---- |
-| `CODEBUDDY_ENDPOINT` | _(空)_ | 完整 base URL 覆盖，优先级最高 |
-| `CODEBUDDY_NETWORK` | `internal` | `internal`/`ioa` → 国内端点；其他 → 国际端点 |
+| `CODEBUDDY_ENDPOINT` | _(空)_ | 国内 provider 完整 base URL 覆盖，优先级最高 |
 | `CODEBUDDY_AUTH` | `auto` | `auto` / `oauth` / `api` |
 | `CODEBUDDY_API_KEY` | _(空)_ | API Key（`ck_xxx`），`auto` 模式下隐含启用 API Key 模式 |
 | `CODEBUDDY_MODEL` | _(空)_ | 强制覆盖请求 model（写进 `X-Model-ID`） |
@@ -60,7 +60,13 @@ export CODEBUDDY_API_KEY=ck_xxx
 | `CODEBUDDY_CONVERSATION_MAP_MAX` | `1000` | session → conversationId LRU 容量 |
 | `CODEBUDDY_TENANT_ID` / `CODEBUDDY_ENTERPRISE_ID` / `CODEBUDDY_USER_ID` | _(从 JWT 提)_ | 覆盖自动提取的身份头（仅 OAuth 模式） |
 
+国际 provider（`codebuddy-intl`）环境变量完全镜像，前缀换成 `CODEBUDDY_INTL_`：`CODEBUDDY_INTL_ENDPOINT`、`CODEBUDDY_INTL_AUTH`、`CODEBUDDY_INTL_API_KEY`、`CODEBUDDY_INTL_MODEL`、…（默认端点 `https://www.codebuddy.ai`）。
+
+> **迁移**：原 `CODEBUDDY_NETWORK=internet` 用户请改用 `codebuddy-intl` provider（需重新 `/login codebuddy-intl`，凭据按 provider id 隔离）；国内用户无感知。`CODEBUDDY_NETWORK` 与 `~/.pi/agent/codebuddy-auth.json` 均已废弃，可删除。
+
 ## 架构
+
+每个 provider 实例（`codebuddy` / `codebuddy-intl`）各一套：
 
 ```
 Pi agent
@@ -71,21 +77,23 @@ streamSimple wrapper（src/stream.ts）
   │ 注入自定义 fetch
   ▼
 auth-fetch 拦截器（src/auth-fetch.ts）
+  │ 从 host 注入的 Authorization 解析 token（JWT → oauth / 其他 → api / 占位 → 401 指引）
   │ 认证头注入（oauth: Bearer + 租户身份头 / api: Bearer + X-API-Key）
-  │ 401/403 → 刷新 token 重试一次
+  │ 首 token 触发懒模型发现
   │ 400+11133 → 1s/4s/10s/25s 幂等重发
   ▼
 ${server}/v2/chat/completions   （协议栈：pi-ai openai-completions）
 ```
 
-token 的过期预检与刷新由 Pi 原生托管（`oauth.refreshToken`，5 分钟 skew + 双检锁，自动持久化到 Pi 凭据存储）；扩展维护一份独立快照（`~/.pi/agent/codebuddy-auth.json`）供请求期读取，流中途 401 时快照兜底刷新。
+凭据唯一事实源是 Pi 的 `auth.json`（按 provider id 各存一份）：host 每流解析 token、过期时带锁预刷新（`oauth.refreshToken`，5 分钟 skew），经 `options.apiKey` 注入 Authorization 头。流中途 token 失效时错误直接透传，Pi 在下一流前自动刷新自愈；扩展不维护任何本地 token 副本。
 
 | 模块 | 来源 |
 | ---- | ---- |
 | `auth-flow.ts` / `auth-state.ts` / `jwt.ts` / `headers.ts` / `lru.ts` / `fetch-json.ts` | 平移自 [opencode-codebuddy-oauth](https://github.com/minglo/opencode-codebuddy-oauth) |
 | `models.ts` | 平移 + 转换为 Pi `ProviderModelConfig` |
-| `auth-fetch.ts` | 平移改造：删 SSE 缓冲与预刷新（Pi 原生托管） |
-| `index.ts` / `stream.ts` | 新写：Pi extension 接线 |
+| `auth-fetch.ts` | 平移改造：删 SSE 缓冲、预刷新与本地快照（token 改由 host 每流注入） |
+| `auth-state.ts` | 重写：从请求头解析鉴权（原为快照读取） |
+| `index.ts` / `stream.ts` | 新写：Pi extension 接线；双 provider 工厂 |
 | `model-cache.ts` | 新写：持久化模型列表，消除启动期发现竞态（见下） |
 
 ### 模型列表缓存
@@ -94,9 +102,10 @@ token 的过期预检与刷新由 Pi 原生托管（`oauth.refreshToken`，5 分
 `codebuddy/<具体模型>` 尚未注册，pi 会报
 `Warning: Could not restore model codebuddy/xxx (model no longer exists)` 并回落到 `auto`。
 
-为此，扩展把上次成功发现的模型落盘到 `~/.pi/agent/codebuddy-models-cache.json`，
-启动时先同步以缓存为种子注册，再等网络发现刷新缓存。缓存只影响「首个可见模型集合」的时机，
-不替代网络发现：发现失败时仍回落到已缓存列表或 `auto`。
+为此，扩展把上次成功发现的模型落盘到 `~/.pi/agent/<providerId>-models-cache.json`
+（`codebuddy-models-cache.json` / `codebuddy-intl-models-cache.json`），
+启动时先同步以缓存为种子注册，再等网络发现刷新缓存（登录后立即触发；运行期首个携带 token 的
+请求懒触发）。缓存只影响「首个可见模型集合」的时机，不替代网络发现：发现失败时仍回落到已缓存列表或 `auto`。
 
 刻意不写入 `models.json`：codebuddy 是扩展注册的 provider，鉴权由 `auth-fetch` 拦截器注入
 （自定义 `streamSimple`）。在 `models.json` 声明同 id 的原生 provider 会产生 baseUrl/api
